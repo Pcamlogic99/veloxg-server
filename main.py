@@ -41,21 +41,128 @@ app.add_middleware(
 def home():
     return {"message": "Welcome to veloxg Search API"}
 
-# Cache records and vectorizer
-cached_records = []
-cached_texts = []
-cached_vectorizer = None
+@app.post("/add")
+def add_link(
+    data: dict = Body(
+        ...,
+        example={
+            "title": "Example Website",
+            "url": "https://example.com",
+            "favicon": "https://example.com/favicon.ico",
+            "meta_description": "This is an example website",
+            "content": "Sample content",
+            "image_url": "https://example.com/image.jpg",
+            "category": "Example"
+        }
+    )
+):
+    if not data.get("title") or not data.get("url"):
+        raise HTTPException(status_code=400, detail="Title and URL are required fields")
+    data["timestamp"] = datetime.utcnow().isoformat()
+    try:
+        response = supabase.from_("veloxg").insert(data).execute()
+        if hasattr(response, 'error') and response.error:
+            logger.error(f"Error adding link: {response.error}")
+            raise HTTPException(status_code=500, detail=f"Database error: {response.error}")
+        # Optional: comment out next line to avoid cache refresh
+        # refresh_cache()
+        return {"message": "Link added successfully", "data": response.data}
+    except Exception as e:
+        logger.error(f"Error adding link: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-def refresh_cache():
-    global cached_records, cached_texts, cached_vectorizer
-    result = supabase.from_("veloxg").select("*").execute()
-    cached_records = result.data if hasattr(result, 'data') else []
-    cached_texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in cached_records]
-    if cached_texts:
-        cached_vectorizer = TfidfVectorizer().fit(cached_texts)
+@app.get("/search")
+def search(
+    q: str = Query(None, min_length=1, description="Search query"),
+    queries: str = Query(None, description="Alternative search query parameter"),
+    x_api_key: str = Header(None)
+):
+    if x_api_key != "secret123":  # Badilisha hapa na key yako halali
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
 
-# Refresh cache at startup
-refresh_cache()
+    search_query = q or queries
+    if not search_query:
+        raise HTTPException(status_code=400, detail="Search query is required (use 'q' or 'queries' parameter)")
+
+    try:
+        logger.info(f"Searching for query: {search_query}")
+        # Fetch data lazily kila search
+        result = supabase.from_("veloxg").select("*").execute()
+        records = result.data if hasattr(result, 'data') else []
+        texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in records]
+        if not texts:
+            return {"results": []}
+        vectorizer = TfidfVectorizer().fit(texts)
+        query_vec = vectorizer.transform([search_query])
+        doc_vecs = vectorizer.transform(texts)
+        similarities = (doc_vecs * query_vec.T).toarray().flatten()
+        fuzzy_scores = [fuzz.token_set_ratio(search_query, text) for text in texts]
+        combined = [
+            (rec, sim, fuzzy)
+            for rec, sim, fuzzy in zip(records, similarities, fuzzy_scores)
+        ]
+        combined.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        top_results = [
+            {
+                **rec,
+                "image_url": rec.get("image_url", None)
+            }
+            for rec, sim, fuzzy in combined if sim > 0.1 or fuzzy > 60
+        ][:10]
+        logger.info(f"Found {len(top_results)} fuzzy/NLP matched records")
+        return {"results": top_results}
+    except Exception as e:
+        logger.error(f"Error in search: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/data")
+def get_data():
+    try:
+        result = supabase.from_("veloxg").select("*").execute()
+        if hasattr(result, 'error') and result.error:
+            logger.error(f"Error fetching data: {result.error}")
+            raise HTTPException(status_code=500, detail=f"Database error: {result.error}")from fastapi import FastAPI, Query, HTTPException, Body, Header
+from fastapi.middleware.cors import CORSMiddleware
+from supabase import create_client, Client
+import os
+from dotenv import load_dotenv
+from datetime import datetime
+import logging
+from rapidfuzz import fuzz
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("Missing required environment variables: SUPABASE_URL or SUPABASE_KEY")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+app = FastAPI(
+    title="VeloxG API",
+    description="FastAPI backend API for VeloxG search engine using Supabase",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+def home():
+    return {"message": "Welcome to veloxg Search API"}
 
 @app.post("/add")
 def add_link(
@@ -80,8 +187,8 @@ def add_link(
         if hasattr(response, 'error') and response.error:
             logger.error(f"Error adding link: {response.error}")
             raise HTTPException(status_code=500, detail=f"Database error: {response.error}")
-        # Refresh cache after adding new link
-        refresh_cache()
+        # Optional: comment out next line to avoid cache refresh
+        # refresh_cache()
         return {"message": "Link added successfully", "data": response.data}
     except Exception as e:
         logger.error(f"Error adding link: {e}")
@@ -102,7 +209,7 @@ def search(
 
     try:
         logger.info(f"Searching for query: {search_query}")
-        # Lazy load data and vectorizer
+        # Fetch data lazily kila search
         result = supabase.from_("veloxg").select("*").execute()
         records = result.data if hasattr(result, 'data') else []
         texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in records]
