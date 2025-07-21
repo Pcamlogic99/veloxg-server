@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException, Body
+from fastapi import FastAPI, Query, HTTPException, Body, Header
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 import os
@@ -67,7 +67,7 @@ def add_link(
             "favicon": "https://example.com/favicon.ico",
             "meta_description": "This is an example website",
             "content": "Sample content",
-            "image_url": "https://example.com/image.jpg",  # <-- imeongezwa hapa
+            "image_url": "https://example.com/image.jpg",
             "category": "Example"
         }
     )
@@ -90,8 +90,12 @@ def add_link(
 @app.get("/search")
 def search(
     q: str = Query(None, min_length=1, description="Search query"),
-    queries: str = Query(None, description="Alternative search query parameter")
+    queries: str = Query(None, description="Alternative search query parameter"),
+    x_api_key: str = Header(None)
 ):
+    if x_api_key != "secret123":  # Badilisha hapa na key yako halali
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
+
     search_query = q or queries
     if not search_query:
         raise HTTPException(status_code=400, detail="Search query is required (use 'q' or 'queries' parameter)")
