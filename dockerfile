@@ -25,8 +25,8 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 COPY *.py .
 
-EXPOSE 8080
+EXPOSE 3000
 
-HEALTHCHECK CMD curl --fail http://localhost:8080/health || exit 1
+HEALTHCHECK CMD curl --fail http://localhost:3000/health || exit 1
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "3000"]
