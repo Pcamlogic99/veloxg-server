@@ -48,11 +48,17 @@ cached_vectorizer = None
 
 def refresh_cache():
     global cached_records, cached_texts, cached_vectorizer
-    result = supabase.from_("veloxg").select("*").execute()
-    cached_records = result.data if hasattr(result, 'data') else []
-    cached_texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in cached_records]
-    if cached_texts:
-        cached_vectorizer = TfidfVectorizer().fit(cached_texts)
+    try:
+        result = supabase.from_("veloxg").select("*").execute()
+        cached_records = result.data if hasattr(result, 'data') else []
+        cached_texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in cached_records]
+        if cached_texts:
+            cached_vectorizer = TfidfVectorizer().fit(cached_texts)
+    except Exception as e:
+        logger.error(f"Error refreshing cache: {e}")
+        cached_records = []
+        cached_texts = []
+        cached_vectorizer = None
 
 # Refresh cache at startup
 refresh_cache()
@@ -67,7 +73,7 @@ def add_link(
             "favicon": "https://example.com/favicon.ico",
             "meta_description": "This is an example website",
             "content": "Sample content",
-            "image_url": "https://example.com/image.jpg",  # <-- imeongezwa hapa
+            "image_url": "https://example.com/image.jpg",
             "category": "Example"
         }
     )
@@ -98,7 +104,6 @@ def search(
 
     try:
         logger.info(f"Searching for query: {search_query}")
-        # Lazy load data and vectorizer
         result = supabase.from_("veloxg").select("*").execute()
         records = result.data if hasattr(result, 'data') else []
         texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in records]
@@ -126,6 +131,29 @@ def search(
     except Exception as e:
         logger.error(f"Error in search: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/search_data")
+async def search_data(q: str = Query(..., alias="q")):
+    try:
+        logger.info(f"Received query: {q}")
+        response = supabase.table("veloxg").select("*").execute()
+        records = response.data if hasattr(response, 'data') else []
+
+        results = []
+        for record in records:
+            combined_text = f"{record.get('title', '')} {record.get('meta_description', '')} {record.get('content', '')}"
+            score = fuzz.partial_ratio(q.lower(), combined_text.lower())
+
+            if score >= 60:
+                results.append({"record": record, "score": score})
+
+        results.sort(key=lambda x: x["score"], reverse=True)
+
+        return {"query": q, "results": results}
+
+    except Exception as e:
+        logger.error(f"Error during search: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/data")
 def get_data():
