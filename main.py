@@ -104,7 +104,8 @@ def search(
 
     try:
         logger.info(f"Searching for query: {search_query}")
-        result = supabase.from_("veloxg").select("*").execute()
+        # Ensure the Supabase client is initialized and the table name is correct
+        result = supabase.table("veloxg").select("*").execute()
         records = result.data if hasattr(result, 'data') else []
         texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in records]
         if not texts:
@@ -157,7 +158,15 @@ async def search_data(q: str = Query(..., alias="q")):
 
 @app.get("/data")
 def get_data():
-    return {"message": "Hello from /data"}
+    try:
+        result = supabase.table("veloxg").select("*").execute()
+        if hasattr(result, 'error') and result.error:
+            logger.error(f"Error fetching data: {result.error}")
+            raise HTTPException(status_code=500, detail=f"Database error: {result.error}")
+        return {"data": result.data}
+    except Exception as e:
+        logger.error(f"Error fetching data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 def health_check():
