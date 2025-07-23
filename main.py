@@ -157,15 +157,7 @@ async def search_data(q: str = Query(..., alias="q")):
 
 @app.get("/data")
 def get_data():
-    try:
-        result = supabase.from_("veloxg").select("*").execute()
-        if hasattr(result, 'error') and result.error:
-            logger.error(f"Error fetching data: {result.error}")
-            raise HTTPException(status_code=500, detail=f"Database error: {result.error}")
-        return {"data": result.data}
-    except Exception as e:
-        logger.error(f"Error fetching data: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"message": "Hello from /data"}
 
 @app.get("/health")
 def health_check():
