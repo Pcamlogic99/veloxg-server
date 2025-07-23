@@ -4,7 +4,7 @@ app = FastAPI()
 
 @app.get("/")
 def home():
-    return {"message": "Welcome to VeloxG Search API"}
+    return {"message": "Welcome to veloxg Search API"}
 
 @app.get("/search")
 def search(query: str = Query(...)):
