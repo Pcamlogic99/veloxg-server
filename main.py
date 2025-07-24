@@ -41,7 +41,7 @@ app.add_middleware(
 def home():
     return {"message": "Welcome to veloxg Search API"}
 
-# Cache records and vectorizer
+# Cache
 cached_records = []
 cached_texts = []
 cached_vectorizer = None
@@ -50,41 +50,29 @@ def refresh_cache():
     global cached_records, cached_texts, cached_vectorizer
     try:
         result = supabase.from_("veloxg").select("*").execute()
-        cached_records = result.data if hasattr(result, 'data') else []
+        if hasattr(result, 'error') and result.error:
+            logger.error(f"Supabase error: {result.error}")
+            cached_records, cached_texts, cached_vectorizer = [], [], None
+            return
+        cached_records = result.data
         cached_texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in cached_records]
         if cached_texts:
             cached_vectorizer = TfidfVectorizer().fit(cached_texts)
+        logger.info(f"Cached {len(cached_records)} records")
     except Exception as e:
         logger.error(f"Error refreshing cache: {e}")
-        cached_records = []
-        cached_texts = []
-        cached_vectorizer = None
+        cached_records, cached_texts, cached_vectorizer = [], [], None
 
-# Refresh cache at startup
 refresh_cache()
 
 @app.post("/add")
-def add_link(
-    data: dict = Body(
-        ...,
-        example={
-            "title": "Example Website",
-            "url": "https://example.com",
-            "favicon": "https://example.com/favicon.ico",
-            "meta_description": "This is an example website",
-            "content": "Sample content",
-            "image_url": "https://example.com/image.jpg",
-            "category": "Example"
-        }
-    )
-):
+def add_link(data: dict = Body(...)):
     if not data.get("title") or not data.get("url"):
-        raise HTTPException(status_code=400, detail="Title and URL are required fields")
+        raise HTTPException(status_code=400, detail="Title and URL are required")
     data["timestamp"] = datetime.utcnow().isoformat()
     try:
         response = supabase.from_("veloxg").insert(data).execute()
         if hasattr(response, 'error') and response.error:
-            logger.error(f"Error adding link: {response.error}")
             raise HTTPException(status_code=500, detail=f"Database error: {response.error}")
         refresh_cache()
         return {"message": "Link added successfully", "data": response.data}
@@ -93,18 +81,16 @@ def add_link(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/search")
-def search(
-    q: str = Query(None, min_length=1, description="Search query"),
-    queries: str = Query(None, description="Alternative search query parameter")
-):
+def search(q: str = Query(None), queries: str = Query(None)):
     search_query = q or queries
     if not search_query:
-        raise HTTPException(status_code=400, detail="Search query is required (use 'q' or 'queries' parameter)")
-
+        raise HTTPException(status_code=400, detail="Search query is required")
     try:
-        logger.info(f"Searching for query: {search_query}")
+        logger.info(f"Searching: {search_query}")
         result = supabase.from_("veloxg").select("*").execute()
-        records = result.data if hasattr(result, 'data') else []
+        if hasattr(result, 'error') and result.error:
+            raise HTTPException(status_code=500, detail=f"Supabase error: {result.error}")
+        records = result.data
         texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in records]
         if not texts:
             return {"results": []}
@@ -113,54 +99,40 @@ def search(
         doc_vecs = vectorizer.transform(texts)
         similarities = (doc_vecs * query_vec.T).toarray().flatten()
         fuzzy_scores = [fuzz.token_set_ratio(search_query, text) for text in texts]
-        combined = [
-            (rec, sim, fuzzy)
-            for rec, sim, fuzzy in zip(records, similarities, fuzzy_scores)
-        ]
+        combined = [(rec, sim, fuzzy) for rec, sim, fuzzy in zip(records, similarities, fuzzy_scores)]
         combined.sort(key=lambda x: (x[1], x[2]), reverse=True)
         top_results = [
-            {
-                **rec,
-                "image_url": rec.get("image_url", None)
-            }
+            {**rec, "image_url": rec.get("image_url", None)}
             for rec, sim, fuzzy in combined if sim > 0.1 or fuzzy > 60
         ][:10]
-        logger.info(f"Found {len(top_results)} fuzzy/NLP matched records")
         return {"results": top_results}
     except Exception as e:
-        logger.error(f"Error in search: {e}")
+        logger.error(f"Search error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/search_data")
-async def search_data(q: str = Query(..., alias="q")):
+async def search_data(q: str = Query(...)):
     try:
-        logger.info(f"Received query: {q}")
-        response = supabase.from_("veloxg").select("*").execute()
-        records = response.data if hasattr(response, 'data') else []
-
+        result = supabase.from_("veloxg").select("*").execute()
+        records = result.data
         results = []
         for record in records:
-            combined_text = f"{record.get('title', '')} {record.get('meta_description', '')} {record.get('content', '')}"
-            score = fuzz.partial_ratio(q.lower(), combined_text.lower())
-
+            combined = f"{record.get('title', '')} {record.get('meta_description', '')} {record.get('content', '')}"
+            score = fuzz.partial_ratio(q.lower(), combined.lower())
             if score >= 60:
                 results.append({"record": record, "score": score})
-
         results.sort(key=lambda x: x["score"], reverse=True)
-
         return {"query": q, "results": results}
-
     except Exception as e:
         logger.error(f"Error during search: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail="Internal error")
 
 @app.get("/data")
 def get_data():
     try:
         result = supabase.from_("veloxg").select("*").execute()
         if hasattr(result, 'error') and result.error:
-            logger.error(f"Error fetching data: {result.error}")
-            raise HTTPException(status_code=500, detail=f"Database error: {result.error}")
+            raise HTTPException(status_code=500, detail=f"Supabase error: {result.error}")
         return {"data": result.data}
     except Exception as e:
         logger.error(f"Error fetching data: {e}")
@@ -174,39 +146,14 @@ def health_check():
 def debug_info():
     try:
         tables = supabase.from_("veloxg").select("*").execute()
-        table_info = {
+        return {
             "connected": True,
             "table_exists": not (hasattr(tables, 'error') and tables.error),
             "record_count": len(tables.data) if hasattr(tables, 'data') else 0,
-            "supabase_url": SUPABASE_URL[:20] + "..." if SUPABASE_URL else None,
+            "supabase_url": SUPABASE_URL[:20] + "...",
             "has_api_key": bool(SUPABASE_KEY),
-            "first_record": tables.data[0] if hasattr(tables, 'data') and len(tables.data) > 0 else None
+            "first_record": tables.data[0] if hasattr(tables, 'data') and tables.data else None
         }
-        return {"debug_info": table_info}
     except Exception as e:
         logger.error(f"Debug error: {e}")
-        return {"debug_info": {"error": str(e), "connected": False}}
-
-# 🔍 Extra Debugging Endpoint
-@app.get("/deep_debug")
-def deep_debug():
-    info = {
-        "supabase_url": SUPABASE_URL,
-        "key_present": bool(SUPABASE_KEY),
-        "key_start": SUPABASE_KEY[:6] + "..." if SUPABASE_KEY else None,
-        "table_name": "veloxg",
-        "status": "checking..."
-    }
-
-    try:
-        result = supabase.from_("veloxg").select("*").limit(1).execute()
-        info["status"] = "connected"
-        info["error"] = None
-        info["record_count"] = len(result.data) if result.data else 0
-        info["sample_record"] = result.data[0] if result.data else None
-        info["raw_result_type"] = str(type(result))
-    except Exception as e:
-        info["status"] = "failed"
-        info["error"] = str(e)
-
-    return {"deep_debug": info}
+        return {"connected": False, "error": str(e)}
