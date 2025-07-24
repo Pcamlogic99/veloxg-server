@@ -103,7 +103,7 @@ def search(
 
     try:
         logger.info(f"Searching for query: {search_query}")
-        result = supabase.table("veloxg").select("*").execute()
+        result = supabase.from_("veloxg").select("*").execute()
         records = result.data if hasattr(result, 'data') else []
         texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in records]
         if not texts:
@@ -135,7 +135,7 @@ def search(
 async def search_data(q: str = Query(..., alias="q")):
     try:
         logger.info(f"Received query: {q}")
-        response = supabase.table("veloxg").select("*").execute()
+        response = supabase.from_("veloxg").select("*").execute()
         records = response.data if hasattr(response, 'data') else []
 
         results = []
@@ -157,7 +157,7 @@ async def search_data(q: str = Query(..., alias="q")):
 @app.get("/data")
 def get_data():
     try:
-        result = supabase.table("veloxg").select("*").execute()
+        result = supabase.from_("veloxg").select("*").execute()
         if hasattr(result, 'error') and result.error:
             logger.error(f"Error fetching data: {result.error}")
             raise HTTPException(status_code=500, detail=f"Database error: {result.error}")
@@ -173,7 +173,7 @@ def health_check():
 @app.get("/debug")
 def debug_info():
     try:
-        tables = supabase.table("veloxg").select("*").execute()
+        tables = supabase.from_("veloxg").select("*").execute()
         table_info = {
             "connected": True,
             "table_exists": not (hasattr(tables, 'error') and tables.error),
