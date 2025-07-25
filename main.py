@@ -27,6 +27,7 @@ app = FastAPI(
     title="veloxg API",
     description="FastAPI backend API for VeloxG search engine using Supabase",
     version="1.0.0"
+root_path="/api"
 )
 
 app.add_middleware(
