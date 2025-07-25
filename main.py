@@ -26,7 +26,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI(
     title="veloxg API",
     description="FastAPI backend API for VeloxG search engine using Supabase",
-    version="1.0.0"
+    version="1.0.0",
 root_path="/api"
 )
 
