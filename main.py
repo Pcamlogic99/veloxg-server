@@ -18,12 +18,8 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-YOUTUBE_API_KEYS = [
-    "AIzaSyXXXX_KEY_1",
-    "AIzaSyXXXX_KEY_2",
-    "AIzaSyXXXX_KEY_3",
-    "AIzaSyXXXX_KEY_4"
-]
+# 🔑 NEW: Read keys from ENV
+YOUTUBE_API_KEYS = os.getenv("YOUTUBE_API_KEYS", "").split(",")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Missing required environment variables: SUPABASE_URL or SUPABASE_KEY")
@@ -57,14 +53,9 @@ def refresh_cache():
     global cached_records, cached_texts, cached_vectorizer
     try:
         result = supabase.from_("veloxg").select("*").execute()
-        if hasattr(result, 'error') and result.error:
-            logger.error(f"Supabase error: {result.error}")
-            cached_records, cached_texts, cached_vectorizer = [], [], None
-            return
-        cached_records = result.data
+        cached_records = result.data or []
         cached_texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in cached_records]
-        if cached_texts:
-            cached_vectorizer = TfidfVectorizer().fit(cached_texts)
+        cached_vectorizer = TfidfVectorizer().fit(cached_texts) if cached_texts else None
         logger.info(f"Cached {len(cached_records)} records")
     except Exception as e:
         logger.error(f"Error refreshing cache: {e}")
@@ -79,8 +70,6 @@ def add_link(data: dict = Body(...)):
     data["timestamp"] = datetime.utcnow().isoformat()
     try:
         response = supabase.from_("veloxg").insert(data).execute()
-        if hasattr(response, 'error') and response.error:
-            raise HTTPException(status_code=500, detail=f"Database error: {response.error}")
         refresh_cache()
         return {"message": "Link added successfully", "data": response.data}
     except Exception as e:
@@ -93,11 +82,8 @@ def search(q: str = Query(None), queries: str = Query(None)):
     if not search_query:
         raise HTTPException(status_code=400, detail="Search query is required")
     try:
-        logger.info(f"Searching: {search_query}")
         result = supabase.from_("veloxg").select("*").execute()
-        if hasattr(result, 'error') and result.error:
-            raise HTTPException(status_code=500, detail=f"Supabase error: {result.error}")
-        records = result.data
+        records = result.data or []
         texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in records]
         if not texts:
             return {"results": []}
@@ -117,56 +103,11 @@ def search(q: str = Query(None), queries: str = Query(None)):
         logger.error(f"Search error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/search_data")
-async def search_data(q: str = Query(...)):
-    try:
-        result = supabase.from_("veloxg").select("*").execute()
-        records = result.data
-        results = []
-        for record in records:
-            combined = f"{record.get('title', '')} {record.get('meta_description', '')} {record.get('content', '')}"
-            score = fuzz.partial_ratio(q.lower(), combined.lower())
-            if score >= 60:
-                results.append({"record": record, "score": score})
-        results.sort(key=lambda x: x["score"], reverse=True)
-        return {"query": q, "results": results}
-    except Exception as e:
-        logger.error(f"Error during search: {e}")
-        raise HTTPException(status_code=500, detail="Internal error")
-
-@app.get("/data")
-def get_data():
-    try:
-        result = supabase.from_("veloxg").select("*").execute()
-        if hasattr(result, 'error') and result.error:
-            raise HTTPException(status_code=500, detail=f"Supabase error: {result.error}")
-        return {"data": result.data}
-    except Exception as e:
-        logger.error(f"Error fetching data: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/health")
-def health_check():
-    return {"status": "healthy", "version": "1.0.0"}
-
-@app.get("/debug")
-def debug_info():
-    try:
-        tables = supabase.from_("veloxg").select("*").execute()
-        return {
-            "connected": True,
-            "table_exists": not (hasattr(tables, 'error') and tables.error),
-            "record_count": len(tables.data) if hasattr(tables, 'data') else 0,
-            "supabase_url": SUPABASE_URL[:20] + "...",
-            "has_api_key": bool(SUPABASE_KEY),
-            "first_record": tables.data[0] if hasattr(tables, 'data') and tables.data else None
-        }
-    except Exception as e:
-        logger.error(f"Debug error: {e}")
-        return {"connected": False, "error": str(e)}
-
 @app.get("/youtube_search")
 def youtube_search(query: str = Query(...)):
+    if not YOUTUBE_API_KEYS or not YOUTUBE_API_KEYS[0]:
+        raise HTTPException(status_code=500, detail="No YouTube API keys configured")
+    
     for key in YOUTUBE_API_KEYS:
         try:
             url = "https://www.googleapis.com/youtube/v3/search"
@@ -175,42 +116,42 @@ def youtube_search(query: str = Query(...)):
                 "q": query,
                 "type": "video",
                 "maxResults": 5,
-                "key": key
+                "key": key.strip()
             }
             response = httpx.get(url, params=params)
             if response.status_code == 200:
                 return {"results": response.json().get("items", [])}
             elif response.status_code == 403:
-                logger.warning(f"Quota exceeded for key: {key}")
-                continue  # try next key
+                logger.warning(f"Quota exceeded or forbidden for key: {key}")
+                continue
         except Exception as e:
             logger.error(f"YouTube API error with key {key}: {e}")
-    raise HTTPException(status_code=500, detail="All YouTube API keys failed or quota exceeded")
+            continue
+    
+    return {"message": "All YouTube API keys failed or quota exceeded"}
 
 @app.get("/search_all")
 def search_all(query: str = Query(...)):
-    # --- Search Supabase ---
-    supabase_results = []
+    supabase_results, youtube_results = [], []
     try:
         result = supabase.from_("veloxg").select("*").execute()
-        records = result.data
+        records = result.data or []
         texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in records]
-        vectorizer = TfidfVectorizer().fit(texts)
-        query_vec = vectorizer.transform([query])
-        doc_vecs = vectorizer.transform(texts)
-        similarities = (doc_vecs * query_vec.T).toarray().flatten()
-        fuzzy_scores = [fuzz.token_set_ratio(query, text) for text in texts]
-        combined = [(rec, sim, fuzzy) for rec, sim, fuzzy in zip(records, similarities, fuzzy_scores)]
-        combined.sort(key=lambda x: (x[1], x[2]), reverse=True)
-        supabase_results = [
-            {**rec, "image_url": rec.get("image_url", None)}
-            for rec, sim, fuzzy in combined if sim > 0.1 or fuzzy > 60
-        ][:10]
+        if texts:
+            vectorizer = TfidfVectorizer().fit(texts)
+            query_vec = vectorizer.transform([query])
+            doc_vecs = vectorizer.transform(texts)
+            similarities = (doc_vecs * query_vec.T).toarray().flatten()
+            fuzzy_scores = [fuzz.token_set_ratio(query, text) for text in texts]
+            combined = [(rec, sim, fuzzy) for rec, sim, fuzzy in zip(records, similarities, fuzzy_scores)]
+            combined.sort(key=lambda x: (x[1], x[2]), reverse=True)
+            supabase_results = [
+                {**rec, "image_url": rec.get("image_url", None)}
+                for rec, sim, fuzzy in combined if sim > 0.1 or fuzzy > 60
+            ][:10]
     except Exception as e:
         logger.error(f"Supabase search error: {e}")
 
-    # --- Search YouTube ---
-    youtube_results = []
     for key in YOUTUBE_API_KEYS:
         try:
             url = "https://www.googleapis.com/youtube/v3/search"
@@ -219,14 +160,14 @@ def search_all(query: str = Query(...)):
                 "q": query,
                 "type": "video",
                 "maxResults": 5,
-                "key": key
+                "key": key.strip()
             }
             response = httpx.get(url, params=params)
             if response.status_code == 200:
                 youtube_results = response.json().get("items", [])
                 break
             elif response.status_code == 403:
-                continue  # Try next key
+                continue
         except Exception as e:
             logger.error(f"YouTube API error: {e}")
             continue
