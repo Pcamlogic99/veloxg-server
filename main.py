@@ -9,16 +9,16 @@ from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
 import httpx
 
-# Configure logging
+# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("veloxg")
 
-# Load environment variables
+# ---------------- Load ENV ----------------
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-# 🔑 NEW: Read keys from ENV
+# Read multiple keys separated by comma
 YOUTUBE_API_KEYS = os.getenv("YOUTUBE_API_KEYS", "").split(",")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -26,9 +26,10 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ---------------- App Config ----------------
 app = FastAPI(
-    title="veloxg API",
-    description="FastAPI backend API for VeloxG search engine using Supabase",
+    title="VeloxG API",
+    description="FastAPI backend API for VeloxG search engine using Supabase + YouTube",
     version="1.0.0"
 )
 
@@ -40,11 +41,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def home():
-    return {"message": "Welcome to veloxg Search API"}
-
-# Cache
+# ---------------- Cache ----------------
 cached_records = []
 cached_texts = []
 cached_vectorizer = None
@@ -62,6 +59,20 @@ def refresh_cache():
         cached_records, cached_texts, cached_vectorizer = [], [], None
 
 refresh_cache()
+
+# ---------------- Routes ----------------
+@app.get("/")
+def home():
+    return {"message": "Welcome to VeloxG Search API"}
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "version": "1.0.0",
+        "youtube_keys_loaded": bool(YOUTUBE_API_KEYS and YOUTUBE_API_KEYS[0]),
+        "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
+    }
 
 @app.post("/add")
 def add_link(data: dict = Body(...)):
@@ -133,6 +144,8 @@ def youtube_search(query: str = Query(...)):
 @app.get("/search_all")
 def search_all(query: str = Query(...)):
     supabase_results, youtube_results = [], []
+    
+    # ---- Supabase Search ----
     try:
         result = supabase.from_("veloxg").select("*").execute()
         records = result.data or []
@@ -152,6 +165,7 @@ def search_all(query: str = Query(...)):
     except Exception as e:
         logger.error(f"Supabase search error: {e}")
 
+    # ---- YouTube Search ----
     for key in YOUTUBE_API_KEYS:
         try:
             url = "https://www.googleapis.com/youtube/v3/search"
