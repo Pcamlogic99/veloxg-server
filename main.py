@@ -7,6 +7,7 @@ from datetime import datetime
 import logging
 from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
+import httpx
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -17,7 +18,7 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-YOUTUBE_API_KEY = [
+YOUTUBE_API_KEYS = [
     "AIzaSyXXXX_KEY_1",
     "AIzaSyXXXX_KEY_2",
     "AIzaSyXXXX_KEY_3",
@@ -163,3 +164,75 @@ def debug_info():
     except Exception as e:
         logger.error(f"Debug error: {e}")
         return {"connected": False, "error": str(e)}
+
+@app.get("/youtube_search")
+def youtube_search(query: str = Query(...)):
+    for key in YOUTUBE_API_KEYS:
+        try:
+            url = "https://www.googleapis.com/youtube/v3/search"
+            params = {
+                "part": "snippet",
+                "q": query,
+                "type": "video",
+                "maxResults": 5,
+                "key": key
+            }
+            response = httpx.get(url, params=params)
+            if response.status_code == 200:
+                return {"results": response.json().get("items", [])}
+            elif response.status_code == 403:
+                logger.warning(f"Quota exceeded for key: {key}")
+                continue  # try next key
+        except Exception as e:
+            logger.error(f"YouTube API error with key {key}: {e}")
+    raise HTTPException(status_code=500, detail="All YouTube API keys failed or quota exceeded")
+
+@app.get("/search_all")
+def search_all(query: str = Query(...)):
+    # --- Search Supabase ---
+    supabase_results = []
+    try:
+        result = supabase.from_("veloxg").select("*").execute()
+        records = result.data
+        texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in records]
+        vectorizer = TfidfVectorizer().fit(texts)
+        query_vec = vectorizer.transform([query])
+        doc_vecs = vectorizer.transform(texts)
+        similarities = (doc_vecs * query_vec.T).toarray().flatten()
+        fuzzy_scores = [fuzz.token_set_ratio(query, text) for text in texts]
+        combined = [(rec, sim, fuzzy) for rec, sim, fuzzy in zip(records, similarities, fuzzy_scores)]
+        combined.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        supabase_results = [
+            {**rec, "image_url": rec.get("image_url", None)}
+            for rec, sim, fuzzy in combined if sim > 0.1 or fuzzy > 60
+        ][:10]
+    except Exception as e:
+        logger.error(f"Supabase search error: {e}")
+
+    # --- Search YouTube ---
+    youtube_results = []
+    for key in YOUTUBE_API_KEYS:
+        try:
+            url = "https://www.googleapis.com/youtube/v3/search"
+            params = {
+                "part": "snippet",
+                "q": query,
+                "type": "video",
+                "maxResults": 5,
+                "key": key
+            }
+            response = httpx.get(url, params=params)
+            if response.status_code == 200:
+                youtube_results = response.json().get("items", [])
+                break
+            elif response.status_code == 403:
+                continue  # Try next key
+        except Exception as e:
+            logger.error(f"YouTube API error: {e}")
+            continue
+
+    return {
+        "query": query,
+        "supabase_results": supabase_results,
+        "youtube_results": youtube_results
+    }
