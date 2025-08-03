@@ -7,6 +7,7 @@ from datetime import datetime
 import logging
 from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
+import requests  #  Added for YouTube API
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +19,14 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+# Load YouTube API keys from environment
+YT_API_KEYS = [
+    os.getenv("YOUTUBE_API_KEY_1"),
+    os.getenv("YOUTUBE_API_KEY_2"),
+    os.getenv("YOUTUBE_API_KEY_3"),
+    os.getenv("YOUTUBE_API_KEY_4"),
+]
+
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Missing required environment variables: SUPABASE_URL or SUPABASE_KEY")
 
@@ -25,7 +34,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(
     title="veloxg API",
-    description="FastAPI backend API for VeloxG search engine using Supabase",
+    description="FastAPI backend API for VeloxG search engine using Supabase + YouTube",
     version="1.0.0"
 )
 
@@ -157,3 +166,35 @@ def debug_info():
     except Exception as e:
         logger.error(f"Debug error: {e}")
         return {"connected": False, "error": str(e)}
+
+# New YouTube search endpoint with key rotation
+current_key_index = 0
+
+def get_next_api_key():
+    global current_key_index
+    key = YT_API_KEYS[current_key_index]
+    current_key_index = (current_key_index + 1) % len(YT_API_KEYS)
+    return key
+
+@app.get("/youtube_search")
+def youtube_search(q: str = Query(...), max_results: int = 8):
+    try:
+        api_key = get_next_api_key()
+        url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&q={q}&type=video&maxResults={max_results}&key={api_key}"
+        response = requests.get(url)
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="YouTube API Error")
+        data = response.json()
+        videos = [
+            {
+                "title": item["snippet"]["title"],
+                "channel": item["snippet"]["channelTitle"],
+                "thumbnail": item["snippet"]["thumbnails"]["default"]["url"],
+                "videoId": item["id"]["videoId"],
+            }
+            for item in data.get("items", [])
+        ]
+        return {"results": videos}
+    except Exception as e:
+        logger.error(f"YouTube search error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
