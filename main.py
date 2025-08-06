@@ -8,6 +8,7 @@ import logging
 from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
 import httpx
+from flask import Flask, jsonify, request
 import requests
 
 # ---------------- Logging ----------------
