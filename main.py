@@ -8,6 +8,7 @@ import logging
 from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
 import httpx
+import requests
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
@@ -140,6 +141,22 @@ def youtube_search(query: str = Query(...)):
             continue
     
     return {"message": "All YouTube API keys failed or quota exceeded"}
+
+
+# ---------------- Dictionary API ----------------
+DICTIONARY_API_URL = "https://api.dictionaryapi.dev/api/v2/entries/en/"
+
+@app.get("/api/dictionary/{word}")
+def dictionary_proxy(word: str):
+    try:
+        response = requests.get(DICTIONARY_API_URL + word)
+        if response.status_code != 200:
+            raise HTTPException(status_code=404, detail="Word not found")
+        return response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+    
 
 @app.get("/search_all")
 def search_all(query: str = Query(...)):
