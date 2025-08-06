@@ -150,9 +150,13 @@ DICTIONARY_API_URL = "https://api.dictionaryapi.dev/api/v2/entries/en/"
 @app.get("/api/dictionary/{word}")
 def dictionary_proxy(word: str):
     try:
-        response = requests.get(DICTIONARY_API_URL + word)
+        response = requests.get(DICTIONARY_API_URL + word, timeout=5)
         if response.status_code != 200:
-            raise HTTPException(status_code=404, detail="Word not found")
+            try:
+                detail = response.json().get("message", "Word not found")
+            except Exception:
+                detail = "Word not found"
+            raise HTTPException(status_code=404, detail=detail)
         return response.json()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
@@ -162,7 +166,7 @@ def dictionary_proxy(word: str):
 @app.get("/search_all")
 def search_all(query: str = Query(...)):
     supabase_results, youtube_results = [], []
-    
+
     # ---- Supabase Search ----
     try:
         result = supabase.from_("veloxg").select("*").execute()
@@ -199,9 +203,12 @@ def search_all(query: str = Query(...)):
                 youtube_results = response.json().get("items", [])
                 break
             elif response.status_code == 403:
+                logger.warning(f"YouTube API quota exceeded or forbidden for key: {key}")
                 continue
+            else:
+                logger.error(f"YouTube API returned status {response.status_code}: {response.text}")
         except Exception as e:
-            logger.error(f"YouTube API error: {e}")
+            logger.error(f"YouTube API error with key {key}: {e}")
             continue
 
     return {
