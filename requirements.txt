@@ -4,4 +4,4 @@ scikit-learn
 rapidfuzz
 supabase
 python-dotenv
-gunicorn
+
