@@ -30,7 +30,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI(
     title="VeloxG API",
     description="FastAPI backend API for VeloxG search engine using Supabase + YouTube + Dictionary",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 app.add_middleware(
@@ -90,7 +90,7 @@ def home():
 def health_check():
     return {
         "status": "healthy",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "youtube_keys_loaded": bool(YOUTUBE_API_KEYS and YOUTUBE_API_KEYS[0]),
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
     }
@@ -172,8 +172,12 @@ def youtube_search(query: str = Query(...)):
     return {"message": "All YouTube API keys failed or quota exceeded"}
 
 @app.get("/search_all")
-def search_all(query: str = Query(...)):
-    supabase_results, youtube_results = [], []
+async def search_all(query: str = Query(...)):
+    supabase_results, youtube_results, dictionary_results = [], [], None
+
+    # ---- Dictionary Search (if single short word) ----
+    if len(query.split()) == 1 and len(query) <= 20:
+        dictionary_results = await get_dictionary_meaning(query)
 
     # ---- Supabase Search ----
     try:
@@ -218,6 +222,7 @@ def search_all(query: str = Query(...)):
 
     return {
         "query": query,
+        "dictionary": dictionary_results,
         "supabase_results": supabase_results,
         "youtube_results": youtube_results
     }
