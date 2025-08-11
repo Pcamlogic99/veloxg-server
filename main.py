@@ -1,172 +1,228 @@
-from fastapi import FastAPI, Query, HTTPException, Body, Request
+from fastapi import FastAPI, Query, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from supabase import create_client, Client
-import os, asyncio
+import os
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
 import httpx
-from typing import List, Optional, Dict, Any
-import numpy as np
 
+# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("veloxg")
+
+# ---------------- Load ENV ----------------
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-YOUTUBE_API_KEYS = [k.strip() for k in os.getenv("YOUTUBE_API_KEYS", "").split(",") if k.strip()]
+# Read multiple keys separated by comma
+YOUTUBE_API_KEYS = os.getenv("YOUTUBE_API_KEYS", "").split(",")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("Missing required env vars: SUPABASE_URL or SUPABASE_KEY")
+    raise ValueError("Missing required environment variables: SUPABASE_URL or SUPABASE_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-app = FastAPI(title="VeloxG API", version="1.6.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+# ---------------- App Config ----------------
+app = FastAPI(
+    title="VeloxG API",
+    description="FastAPI backend API for VeloxG search engine using Supabase + YouTube + Dictionary",
+    version="1.2.0"
 )
 
-cached_records: List[Dict[str, Any]] = []
-cached_texts: List[str] = []
-cached_vectorizer: Optional[TfidfVectorizer] = None
-cached_matrix = None
-search_cache: Dict[str, Dict[str, Any]] = {}
-rate_limit_data: Dict[str, List[float]] = {}
-RATE_LIMIT, RATE_LIMIT_PERIOD = 10, 60  # 10 req/minute
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------- Cache ----------------
+cached_records = []
+cached_texts = []
+cached_vectorizer = None
 
 def refresh_cache():
-    global cached_records, cached_texts, cached_vectorizer, cached_matrix
+    global cached_records, cached_texts, cached_vectorizer
     try:
-        res = supabase.from_("veloxg").select("*").execute()
-        cached_records = res.data or []
-        cached_texts = [f"{(r.get('title') or '').strip()} {(r.get('meta_description') or '').strip()}"
-                        for r in cached_records]
-        if not any(t.strip() for t in cached_texts):
-            cached_records = [{"title": "VeloxG Default", "meta_description": "Default description"}]
-            cached_texts = ["VeloxG Default Default description"]
-        cached_vectorizer = TfidfVectorizer().fit(cached_texts)
-        cached_matrix = cached_vectorizer.transform(cached_texts)
-        logger.info(f"Cache loaded: {len(cached_records)} records")
+        result = supabase.from_("veloxg").select("*").execute()
+        cached_records = result.data or []
+        cached_texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in cached_records]
+        cached_vectorizer = TfidfVectorizer().fit(cached_texts) if cached_texts else None
+        logger.info(f"Cached {len(cached_records)} records")
     except Exception as e:
-        logger.error(f"Cache error: {e}")
-        cached_records, cached_texts, cached_vectorizer, cached_matrix = [], [], None, None
+        logger.error(f"Error refreshing cache: {e}")
+        cached_records, cached_texts, cached_vectorizer = [], [], None
 
 refresh_cache()
 
+# ---------------- Dictionary Lookup ----------------
 async def get_dictionary_meaning(word: str):
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
-            r = await client.get(url)
-            if r.status_code == 200:
-                data = r.json()
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
                 if isinstance(data, list) and data:
-                    out = []
-                    for m in data[0].get("meanings", []):
-                        pos = m.get("partOfSpeech", "")
-                        for d in m.get("definitions", []):
-                            out.append(f"{pos}: {d.get('definition', '')}")
-                    return out[:3]
+                    meanings = []
+                    for meaning in data[0].get("meanings", []):
+                        part_of_speech = meaning.get("partOfSpeech", "")
+                        defs = [d.get("definition", "") for d in meaning.get("definitions", [])]
+                        for d in defs:
+                            meanings.append(f"{part_of_speech}: {d}")
+                    return meanings[:3]  # first 3 short meanings
+            return None
     except Exception as e:
-        logger.error(f"Dictionary error: {e}")
-    return None
+        logger.error(f"Dictionary API error: {e}")
+        return None
 
-def rate_limiter(ip: str) -> bool:
-    import time
-    now = time.time()
-    ts = [t for t in rate_limit_data.get(ip, []) if now - t < RATE_LIMIT_PERIOD]
-    if len(ts) >= RATE_LIMIT: return False
-    ts.append(now); rate_limit_data[ip] = ts
-    return True
-
-def batch_scores(query: str):
-    if not cached_vectorizer or cached_matrix is None: return []
-    q_vec = cached_vectorizer.transform([query])
-    tfidf_scores = np.array(cached_matrix.dot(q_vec.T)).flatten()
-    fuzzy_scores = np.array([fuzz.token_set_ratio(query, txt)/100 for txt in cached_texts])
-    return tfidf_scores + fuzzy_scores
-
-@app.middleware("http")
-async def limiter(request: Request, call_next):
-    if not rate_limiter(request.client.host):
-        return JSONResponse(status_code=429, content={"detail": "Too many requests"})
-    return await call_next(request)
-
-@app.get("/") 
-def home(): return {"msg": "Welcome to VeloxG API"}
+# ---------------- Routes ----------------
+@app.get("/")
+def home():
+    return {"message": "Welcome to VeloxG Search API"}
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "version": "1.6.0", "records": len(cached_records)}
+def health_check():
+    return {
+        "status": "healthy",
+        "version": "1.2.0",
+        "youtube_keys_loaded": bool(YOUTUBE_API_KEYS and YOUTUBE_API_KEYS[0]),
+        "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
+    }
 
 @app.post("/add")
 def add_link(data: dict = Body(...)):
     if not data.get("title") or not data.get("url"):
-        raise HTTPException(400, "Title & URL required")
+        raise HTTPException(status_code=400, detail="Title and URL are required")
     data["timestamp"] = datetime.utcnow().isoformat()
     try:
-        supabase.from_("veloxg").insert(data).execute()
+        response = supabase.from_("veloxg").insert(data).execute()
         refresh_cache()
-        return {"msg": "Link added"}
+        return {"message": "Link added successfully", "data": response.data}
     except Exception as e:
-        logger.error(e)
-        raise HTTPException(500, str(e))
-
-@app.get("/refresh_cache")
-def manual_refresh(): refresh_cache(); return {"msg": "Cache refreshed"}
+        logger.error(f"Error adding link: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/search")
-async def search(q: Optional[str] = Query(None), queries: Optional[str] = Query(None),
-                 page: int = 1, per_page: int = 10):
+async def search(q: str = Query(None), queries: str = Query(None)):
     search_query = q or queries
-    if not search_query: raise HTTPException(400, "Query required")
-    ck = f"{search_query.lower()}_{page}_{per_page}"
-    if ck in search_cache and (datetime.utcnow() - search_cache[ck]["ts"]) < timedelta(minutes=5):
-        return search_cache[ck]["res"]
-    dict_task = None
+    if not search_query:
+        raise HTTPException(status_code=400, detail="Search query is required")
+
+    # -------- Dictionary Lookup for short single words --------
+    dictionary_results = None
     if len(search_query.split()) == 1 and len(search_query) <= 20:
-        dict_task = asyncio.create_task(get_dictionary_meaning(search_query))
-    scores = batch_scores(search_query)
-    results = [(rec, scores[i]) for i, rec in enumerate(cached_records) if scores[i] > 0.05]
-    results.sort(key=lambda x: x[1], reverse=True)
-    page_res = [{**r, "image_url": r.get("image_url")} for r, _ in results[(page-1)*per_page: page*per_page]]
-    resp = {"query": search_query, "page": page, "total_results": len(results),
-            "results": page_res, "dictionary": await dict_task if dict_task else None}
-    search_cache[ck] = {"ts": datetime.utcnow(), "res": resp}
-    return resp
+        dictionary_results = await get_dictionary_meaning(search_query)
+
+    try:
+        result = supabase.from_("veloxg").select("*").execute()
+        records = result.data or []
+        texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in records]
+        if not texts:
+            return {"results": [], "dictionary": dictionary_results}
+
+        vectorizer = TfidfVectorizer().fit(texts)
+        query_vec = vectorizer.transform([search_query])
+        doc_vecs = vectorizer.transform(texts)
+        similarities = (doc_vecs * query_vec.T).toarray().flatten()
+        fuzzy_scores = [fuzz.token_set_ratio(search_query, text) for text in texts]
+        combined = [(rec, sim, fuzzy) for rec, sim, fuzzy in zip(records, similarities, fuzzy_scores)]
+        combined.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        top_results = [
+            {**rec, "image_url": rec.get("image_url", None)}
+            for rec, sim, fuzzy in combined if sim > 0.1 or fuzzy > 60
+        ][:10]
+
+        return {"results": top_results, "dictionary": dictionary_results}
+
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/youtube_search")
-async def youtube_search(query: str = Query(...)):
-    if not YOUTUBE_API_KEYS: raise HTTPException(500, "No YouTube keys")
-    async with httpx.AsyncClient() as client:
-        for key in YOUTUBE_API_KEYS:
-            try:
-                params = {"part": "snippet", "q": query, "type": "video", "maxResults": 5, "key": key}
-                r = await client.get("https://www.googleapis.com/youtube/v3/search", params=params)
-                if r.status_code == 200: return {"results": r.json().get("items", [])}
-                if r.status_code == 403: continue
-            except Exception as e: logger.error(e)
-    return {"msg": "YouTube quota exceeded or failed"}
+def youtube_search(query: str = Query(...)):
+    if not YOUTUBE_API_KEYS or not YOUTUBE_API_KEYS[0]:
+        raise HTTPException(status_code=500, detail="No YouTube API keys configured")
+
+    for key in YOUTUBE_API_KEYS:
+        try:
+            url = "https://www.googleapis.com/youtube/v3/search"
+            params = {
+                "part": "snippet",
+                "q": query,
+                "type": "video",
+                "maxResults": 5,
+                "key": key.strip()
+            }
+            response = httpx.get(url, params=params)
+            if response.status_code == 200:
+                return {"results": response.json().get("items", [])}
+            elif response.status_code == 403:
+                logger.warning(f"Quota exceeded or forbidden for key: {key}")
+                continue
+        except Exception as e:
+            logger.error(f"YouTube API error with key {key}: {e}")
+            continue
+
+    return {"message": "All YouTube API keys failed or quota exceeded"}
 
 @app.get("/search_all")
-async def search_all(query: str = Query(...), page: int = 1, per_page: int = 10):
-    dict_task = None
+async def search_all(query: str = Query(...)):
+    supabase_results, youtube_results, dictionary_results = [], [], None
+
+    # ---- Dictionary Search (if single short word) ----
     if len(query.split()) == 1 and len(query) <= 20:
-        dict_task = asyncio.create_task(get_dictionary_meaning(query))
-    scores = batch_scores(query)
-    results = [(rec, scores[i]) for i, rec in enumerate(cached_records) if scores[i] > 0.05]
-    results.sort(key=lambda x: x[1], reverse=True)
-    supa_page = [{**r, "image_url": r.get("image_url")} for r, _ in results[(page-1)*per_page: page*per_page]]
-    yt_task = asyncio.create_task(youtube_search(query))
+        dictionary_results = await get_dictionary_meaning(query)
+
+    # ---- Supabase Search ----
+    try:
+        result = supabase.from_("veloxg").select("*").execute()
+        records = result.data or []
+        texts = [f"{r.get('title', '')} {r.get('meta_description', '')}" for r in records]
+        if texts:
+            vectorizer = TfidfVectorizer().fit(texts)
+            query_vec = vectorizer.transform([query])
+            doc_vecs = vectorizer.transform(texts)
+            similarities = (doc_vecs * query_vec.T).toarray().flatten()
+            fuzzy_scores = [fuzz.token_set_ratio(query, text) for text in texts]
+            combined = [(rec, sim, fuzzy) for rec, sim, fuzzy in zip(records, similarities, fuzzy_scores)]
+            combined.sort(key=lambda x: (x[1], x[2]), reverse=True)
+            supabase_results = [
+                {**rec, "image_url": rec.get("image_url", None)}
+                for rec, sim, fuzzy in combined if sim > 0.1 or fuzzy > 60
+            ][:10]
+    except Exception as e:
+        logger.error(f"Supabase search error: {e}")
+
+    # ---- YouTube Search ----
+    for key in YOUTUBE_API_KEYS:
+        try:
+            url = "https://www.googleapis.com/youtube/v3/search"
+            params = {
+                "part": "snippet",
+                "q": query,
+                "type": "video",
+                "maxResults": 5,
+                "key": key.strip()
+            }
+            response = httpx.get(url, params=params)
+            if response.status_code == 200:
+                youtube_results = response.json().get("items", [])
+                break
+            elif response.status_code == 403:
+                continue
+        except Exception as e:
+            logger.error(f"YouTube API error: {e}")
+            continue
+
     return {
-        "query": query, "page": page, "per_page": per_page,
-        "dictionary": await dict_task if dict_task else None,
-        "supabase_results": supa_page,
-        "youtube_results": (await yt_task).get("results", [])
+        "query": query,
+        "dictionary": dictionary_results,
+        "supabase_results": supabase_results,
+        "youtube_results": youtube_results
     }
