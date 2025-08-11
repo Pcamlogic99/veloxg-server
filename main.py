@@ -9,7 +9,6 @@ import logging
 from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
 import httpx
-import asyncio
 from typing import List, Optional, Dict, Any
 
 logging.basicConfig(level=logging.INFO)
@@ -29,7 +28,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI(
     title="VeloxG API",
     description="FastAPI backend API for VeloxG search engine using Supabase + YouTube + Dictionary",
-    version="1.4.0"
+    version="1.4.1"
 )
 
 app.add_middleware(
@@ -45,21 +44,20 @@ cached_records: List[Dict[str, Any]] = []
 cached_texts: List[str] = []
 cached_vectorizer: Optional[TfidfVectorizer] = None
 
-# Cache search results: query -> (timestamp, results)
 search_cache: Dict[str, Dict[str, Any]] = {}
-
-# Simple in-memory rate limiting: ip -> [timestamps of requests]
 rate_limit_data: Dict[str, List[float]] = {}
-RATE_LIMIT = 10  # max 10 requests
-RATE_LIMIT_PERIOD = 60  # per 60 seconds
+RATE_LIMIT = 10
+RATE_LIMIT_PERIOD = 60  # seconds
+
 
 def refresh_cache():
     global cached_records, cached_texts, cached_vectorizer
     try:
         result = supabase.from_("veloxg").select("*").execute()
         cached_records = result.data or []
+        # Safisha None values mapema
         cached_texts = [
-            f"{r.get('title', '')} {r.get('meta_description', '')}"
+            f"{(r.get('title') or '').strip()} {(r.get('meta_description') or '').strip()}"
             for r in cached_records
         ]
         cached_vectorizer = TfidfVectorizer().fit(cached_texts) if cached_texts else None
@@ -68,7 +66,9 @@ def refresh_cache():
         logger.error(f"Error refreshing cache: {e}")
         cached_records, cached_texts, cached_vectorizer = [], [], None
 
+
 refresh_cache()
+
 
 async def get_dictionary_meaning(word: str):
     try:
@@ -90,11 +90,11 @@ async def get_dictionary_meaning(word: str):
         logger.error(f"Dictionary API error: {e}")
         return None
 
+
 def rate_limiter(ip: str) -> bool:
     import time
     now = time.time()
     timestamps = rate_limit_data.get(ip, [])
-    # Remove timestamps older than RATE_LIMIT_PERIOD
     timestamps = [ts for ts in timestamps if now - ts < RATE_LIMIT_PERIOD]
     if len(timestamps) >= RATE_LIMIT:
         return False
@@ -102,16 +102,21 @@ def rate_limiter(ip: str) -> bool:
     rate_limit_data[ip] = timestamps
     return True
 
-def weighted_score(title: str, description: str, query: str, vectorizer: TfidfVectorizer):
-    # Weight title higher than description
-    texts = [title, description]
-    weights = [0.7, 0.3]  # example weights
 
+def weighted_score(title: Optional[str], description: Optional[str], query: Optional[str], vectorizer: TfidfVectorizer):
+    title = title or ""
+    description = description or ""
+    query = query or ""
+    texts = [title, description]
+    weights = [0.7, 0.3]
     tfidf = vectorizer.transform(texts)
     query_vec = vectorizer.transform([query])
-
-    scores = [(tfidf[i].dot(query_vec.T).toarray()[0][0]) * weights[i] for i in range(len(texts))]
+    scores = [
+        (tfidf[i].dot(query_vec.T).toarray()[0][0]) * weights[i]
+        for i in range(len(texts))
+    ]
     return sum(scores)
+
 
 @app.middleware("http")
 async def check_rate_limit(request: Request, call_next):
@@ -121,18 +126,21 @@ async def check_rate_limit(request: Request, call_next):
     response = await call_next(request)
     return response
 
+
 @app.get("/")
 def home():
     return {"message": "Welcome to VeloxG Search API"}
+
 
 @app.get("/health")
 def health_check():
     return {
         "status": "healthy",
-        "version": "1.4.0",
+        "version": "1.4.1",
         "youtube_keys_loaded": bool(YOUTUBE_API_KEYS and YOUTUBE_API_KEYS[0]),
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
     }
+
 
 @app.post("/add")
 def add_link(data: dict = Body(...)):
@@ -147,10 +155,12 @@ def add_link(data: dict = Body(...)):
         logger.error(f"Error adding link: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/refresh_cache")
 def manual_refresh_cache():
     refresh_cache()
     return {"message": "Cache refreshed successfully", "total_records": len(cached_records)}
+
 
 @app.get("/search")
 async def search(
@@ -163,7 +173,6 @@ async def search(
     if not search_query:
         raise HTTPException(status_code=400, detail="Search query is required")
 
-    # Check cache for results
     cache_key = f"{search_query.lower()}_{page}_{per_page}"
     cache_entry = search_cache.get(cache_key)
     if cache_entry and (datetime.utcnow() - cache_entry["timestamp"]) < timedelta(minutes=5):
@@ -177,24 +186,18 @@ async def search(
     if not cached_vectorizer or not cached_texts:
         return {"results": [], "dictionary": dictionary_results}
 
-    # Vectorize query
-    query_vec = cached_vectorizer.transform([search_query])
     results_with_scores = []
     for rec, text in zip(cached_records, cached_texts):
-        title = rec.get("title", "")
-        desc = rec.get("meta_description", "")
-        # Weighted TF-IDF score for title and description
+        title = rec.get("title") or ""
+        desc = rec.get("meta_description") or ""
         score = weighted_score(title, desc, search_query, cached_vectorizer)
-        # Fuzzy matching score
         fuzzy = fuzz.token_set_ratio(search_query, text)
-        combined_score = score + (fuzzy / 100)  # combine normalized fuzzy with tf-idf
+        combined_score = score + (fuzzy / 100)
         if combined_score > 0.1:
             results_with_scores.append((rec, combined_score))
 
-    # Sort by combined score descending
     results_with_scores.sort(key=lambda x: x[1], reverse=True)
 
-    # Pagination
     start = (page - 1) * per_page
     end = start + per_page
     page_results = [
@@ -210,10 +213,9 @@ async def search(
         "dictionary": dictionary_results,
     }
 
-    # Cache results
     search_cache[cache_key] = {"timestamp": datetime.utcnow(), "results": response}
-
     return response
+
 
 @app.get("/youtube_search")
 async def youtube_search(query: str = Query(..., min_length=1, max_length=100)):
@@ -243,6 +245,7 @@ async def youtube_search(query: str = Query(..., min_length=1, max_length=100)):
 
     return {"message": "All YouTube API keys failed or quota exceeded"}
 
+
 @app.get("/search_all")
 async def search_all(
     query: str = Query(..., min_length=1, max_length=100),
@@ -257,11 +260,10 @@ async def search_all(
         dictionary_results = await get_dictionary_meaning(query)
 
     if cached_vectorizer and cached_texts:
-        query_vec = cached_vectorizer.transform([query])
         results_with_scores = []
         for rec, text in zip(cached_records, cached_texts):
-            title = rec.get("title", "")
-            desc = rec.get("meta_description", "")
+            title = rec.get("title") or ""
+            desc = rec.get("meta_description") or ""
             score = weighted_score(title, desc, query, cached_vectorizer)
             fuzzy = fuzz.token_set_ratio(query, text)
             combined_score = score + (fuzzy / 100)
