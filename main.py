@@ -1,8 +1,5 @@
 from fastapi import FastAPI, Query, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 from supabase import create_client, Client
 import os
 from dotenv import load_dotenv
@@ -14,6 +11,8 @@ import httpx
 import asyncio
 import re
 from typing import Optional
+from collections import defaultdict
+import time
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
@@ -21,7 +20,6 @@ logger = logging.getLogger("veloxg")
 
 # ---------------- Load ENV ----------------
 load_dotenv()
-
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 YOUTUBE_API_KEYS = [k.strip() for k in os.getenv("YOUTUBE_API_KEYS", "").split(",") if k.strip()]
@@ -32,11 +30,9 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ---------------- App Config ----------------
-limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="VeloxG API", version="3.0.0")
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app = FastAPI(title="VeloxG API", version="3.1.0")
 
+# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,6 +40,37 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------- Security Headers ----------------
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    return response
+
+# ---------------- Custom Rate Limiting ----------------
+RATE_LIMITS = {
+    "/search": (20, 60),       # 20 requests per 60 seconds
+    "/youtube_search": (10, 60),
+    "/add": (5, 60)
+}
+rate_limit_store = defaultdict(list)
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    path = request.url.path
+    if path in RATE_LIMITS:
+        limit, period = RATE_LIMITS[path]
+        ip = request.client.host
+        now = time.time()
+        request_times = [t for t in rate_limit_store[ip] if now - t < period]
+        if len(request_times) >= limit:
+            return HTTPException(status_code=429, detail="Rate limit exceeded")
+        request_times.append(now)
+        rate_limit_store[ip] = request_times
+    return await call_next(request)
 
 # ---------------- Cache ----------------
 cached_records = []
@@ -112,20 +139,18 @@ def home():
 def health_check():
     return {
         "status": "healthy",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "youtube_keys_loaded": bool(YOUTUBE_API_KEYS),
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY),
         "cached_records": len(cached_records)
     }
 
-# ---------------- Supabase + Dictionary + Wikimedia Search ----------------
+# ---------------- Search Endpoint ----------------
 @app.get("/search")
-@limiter.limit("20/minute")  # limit per IP
 async def search(
     q: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=50),
-    request: Request = None
 ):
     if not q:
         raise HTTPException(status_code=400, detail="Search query required")
@@ -134,12 +159,12 @@ async def search(
 
     results = []
 
-    # 1️⃣ Dictionary for single short words
+    # Dictionary lookup
     dictionary_results = None
     if len(q.split()) == 1 and len(q) <= 20:
         dictionary_results = await get_dictionary_meaning(q)
 
-    # 2️⃣ Supabase search
+    # Supabase search
     if cached_texts and cached_vectorizer:
         query_vec = cached_vectorizer.transform([q])
         doc_vecs = cached_vectorizer.transform(cached_texts)
@@ -153,13 +178,13 @@ async def search(
         ]
         results.extend(supabase_results[:limit])
 
-    # 3️⃣ Wikimedia API search
+    # Wikimedia API search
     try:
         wikimedia_url = (
             "https://en.wikipedia.org/w/api.php?"
-            "action=query&generator=search&gsrsearch={query}&"
+            f"action=query&generator=search&gsrsearch={q}&"
             "prop=pageimages|extracts&exintro&explaintext&format=json&pithumbsize=200"
-        ).format(query=q)
+        )
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(wikimedia_url)
             data = resp.json()
@@ -184,8 +209,7 @@ async def search(
 
 # ---------------- YouTube Search ----------------
 @app.get("/youtube_search")
-@limiter.limit("10/minute")
-def youtube_search(query: str = Query(...), request: Request = None):
+def youtube_search(query: str = Query(...)):
     query = sanitize_query(query)
     if not YOUTUBE_API_KEYS:
         raise HTTPException(status_code=500, detail="No YouTube API keys configured")
@@ -211,10 +235,9 @@ def youtube_search(query: str = Query(...), request: Request = None):
             continue
     return {"message": "All YouTube API keys failed or quota exceeded"}
 
-# ---------------- Add new Supabase link ----------------
+# ---------------- Add Link ----------------
 @app.post("/add")
-@limiter.limit("5/minute")  # prevent spam inserts
-def add_link(data: dict = Body(...), request: Request = None):
+def add_link(data: dict = Body(...)):
     if not data.get("title") or not data.get("url"):
         raise HTTPException(status_code=400, detail="Title and URL required")
     data["timestamp"] = datetime.utcnow().isoformat()
