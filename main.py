@@ -11,8 +11,6 @@ import httpx
 import asyncio
 import re
 from typing import Optional
-from collections import defaultdict
-import time
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +18,7 @@ logger = logging.getLogger("veloxg")
 
 # ---------------- Load ENV ----------------
 load_dotenv()
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 YOUTUBE_API_KEYS = [k.strip() for k in os.getenv("YOUTUBE_API_KEYS", "").split(",") if k.strip()]
@@ -30,9 +29,12 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ---------------- App Config ----------------
-app = FastAPI(title="VeloxG API", version="3.1.0")
+app = FastAPI(
+    title="VeloxG API",
+    description="FastAPI backend API for VeloxG search engine using Supabase + YouTube + Dictionary",
+    version="2.0.0"
+)
 
-# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,37 +42,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ---------------- Security Headers ----------------
-@app.middleware("http")
-async def security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    return response
-
-# ---------------- Custom Rate Limiting ----------------
-RATE_LIMITS = {
-    "/search": (20, 60),       # 20 requests per 60 seconds
-    "/youtube_search": (10, 60),
-    "/add": (5, 60)
-}
-rate_limit_store = defaultdict(list)
-
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    path = request.url.path
-    if path in RATE_LIMITS:
-        limit, period = RATE_LIMITS[path]
-        ip = request.client.host
-        now = time.time()
-        request_times = [t for t in rate_limit_store[ip] if now - t < period]
-        if len(request_times) >= limit:
-            return HTTPException(status_code=429, detail="Rate limit exceeded")
-        request_times.append(now)
-        rate_limit_store[ip] = request_times
-    return await call_next(request)
 
 # ---------------- Cache ----------------
 cached_records = []
@@ -121,7 +92,7 @@ async def get_dictionary_meaning(word: str):
         logger.error(f"Dictionary API error: {e}")
         return None
 
-# ---------------- Input Validation ----------------
+# ---------------- Basic Input Validation ----------------
 def sanitize_query(q: str) -> str:
     q = q.strip()
     if len(q) > 100:
@@ -139,75 +110,69 @@ def home():
 def health_check():
     return {
         "status": "healthy",
-        "version": "3.1.0",
+        "version": "2.0.0",
         "youtube_keys_loaded": bool(YOUTUBE_API_KEYS),
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY),
         "cached_records": len(cached_records)
     }
 
-# ---------------- Search Endpoint ----------------
+@app.post("/add")
+def add_link(data: dict = Body(...)):
+    if not data.get("title") or not data.get("url"):
+        raise HTTPException(status_code=400, detail="Title and URL are required")
+    data["timestamp"] = datetime.utcnow().isoformat()
+    try:
+        response = supabase.from_("veloxg").insert(data).execute()
+        refresh_cache(force=True)
+        return {"message": "Link added successfully", "data": response.data}
+    except Exception as e:
+        logger.error(f"Error adding link: {e}")
+        raise HTTPException(status_code=500, detail="Database insert failed")
+
 @app.get("/search")
 async def search(
     q: Optional[str] = Query(None),
+    queries: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=50),
+    limit: int = Query(10, ge=1, le=50)
 ):
-    if not q:
-        raise HTTPException(status_code=400, detail="Search query required")
-    q = sanitize_query(q)
+    search_query = q or queries
+    if not search_query:
+        raise HTTPException(status_code=400, detail="Search query is required")
+
+    search_query = sanitize_query(search_query)
     refresh_cache()
 
-    results = []
-
-    # Dictionary lookup
+    # Dictionary for single short words
     dictionary_results = None
-    if len(q.split()) == 1 and len(q) <= 20:
-        dictionary_results = await get_dictionary_meaning(q)
+    if len(search_query.split()) == 1 and len(search_query) <= 20:
+        dictionary_results = await get_dictionary_meaning(search_query)
 
-    # Supabase search
-    if cached_texts and cached_vectorizer:
-        query_vec = cached_vectorizer.transform([q])
-        doc_vecs = cached_vectorizer.transform(cached_texts)
-        similarities = (doc_vecs * query_vec.T).toarray().flatten()
-        fuzzy_scores = [fuzz.token_set_ratio(q, text) for text in cached_texts]
-        combined = [(rec, sim, fuzzy) for rec, sim, fuzzy in zip(cached_records, similarities, fuzzy_scores)]
-        combined.sort(key=lambda x: (x[1], x[2]), reverse=True)
-        supabase_results = [
-            {**rec, "image_url": rec.get("image_url", None)}
-            for rec, sim, fuzzy in combined if sim > 0.1 or fuzzy > 60
-        ]
-        results.extend(supabase_results[:limit])
+    if not cached_texts or not cached_vectorizer:
+        return {"results": [], "dictionary": dictionary_results}
 
-    # Wikimedia API search
-    try:
-        wikimedia_url = (
-            "https://en.wikipedia.org/w/api.php?"
-            f"action=query&generator=search&gsrsearch={q}&"
-            "prop=pageimages|extracts&exintro&explaintext&format=json&pithumbsize=200"
-        )
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(wikimedia_url)
-            data = resp.json()
-            if "query" in data and "pages" in data["query"]:
-                for page_data in data["query"]["pages"].values():
-                    results.append({
-                        "title": page_data.get("title"),
-                        "extract": page_data.get("extract", ""),
-                        "image_url": page_data.get("thumbnail", {}).get("source"),
-                        "page_url": f"https://en.wikipedia.org/?curid={page_data.get('pageid')}"
-                    })
-    except Exception as e:
-        logger.error(f"Wikimedia API error: {e}")
+    query_vec = cached_vectorizer.transform([search_query])
+    doc_vecs = cached_vectorizer.transform(cached_texts)
+    similarities = (doc_vecs * query_vec.T).toarray().flatten()
+    fuzzy_scores = [fuzz.token_set_ratio(search_query, text) for text in cached_texts]
+    combined = [(rec, sim, fuzzy) for rec, sim, fuzzy in zip(cached_records, similarities, fuzzy_scores)]
+    combined.sort(key=lambda x: (x[1], x[2]), reverse=True)
+
+    start = (page - 1) * limit
+    end = start + limit
+    top_results = [
+        {**rec, "image_url": rec.get("image_url", None)}
+        for rec, sim, fuzzy in combined if sim > 0.1 or fuzzy > 60
+    ][start:end]
 
     return {
         "page": page,
         "limit": limit,
-        "total_results": len(results),
-        "results": results[:limit],
+        "total_results": len(combined),
+        "results": top_results,
         "dictionary": dictionary_results
     }
 
-# ---------------- YouTube Search ----------------
 @app.get("/youtube_search")
 def youtube_search(query: str = Query(...)):
     query = sanitize_query(query)
@@ -234,17 +199,3 @@ def youtube_search(query: str = Query(...)):
             logger.error(f"YouTube API error with key {key}: {e}")
             continue
     return {"message": "All YouTube API keys failed or quota exceeded"}
-
-# ---------------- Add Link ----------------
-@app.post("/add")
-def add_link(data: dict = Body(...)):
-    if not data.get("title") or not data.get("url"):
-        raise HTTPException(status_code=400, detail="Title and URL required")
-    data["timestamp"] = datetime.utcnow().isoformat()
-    try:
-        response = supabase.from_("veloxg").insert(data).execute()
-        refresh_cache(force=True)
-        return {"message": "Link added", "data": response.data}
-    except Exception as e:
-        logger.error(f"Error adding link: {e}")
-        raise HTTPException(status_code=500, detail="Database insert failed")
