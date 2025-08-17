@@ -8,7 +8,6 @@ import logging
 from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
 import httpx
-import asyncio
 import re
 from typing import Optional
 from collections import defaultdict
@@ -31,17 +30,13 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # ---------------- Load YouTube Keys ----------------
 def load_youtube_keys():
     keys = []
-    # inasoma key kuu (comma separated)
     main_key = os.getenv("YOUTUBE_API_KEYS")
     if main_key:
         keys.extend([k.strip() for k in main_key.split(",") if k.strip()])
-    
-    # inasoma key zingine zilizotajwa kama YOUTUBE_API_KEYS1,2,3...
-    for i in range(1, 10):  # ongeza range ukiwa na nyingi zaidi
+    for i in range(1, 10):
         extra_key = os.getenv(f"YOUTUBE_API_KEYS{i}")
         if extra_key:
             keys.append(extra_key.strip())
-    
     return keys
 
 YOUTUBE_API_KEYS = load_youtube_keys()
@@ -69,8 +64,7 @@ async def security_headers(request: Request, call_next):
 
 # ---------------- Custom Rate Limiting ----------------
 RATE_LIMITS = {
-    "/search": (20, 60),       # 20 requests per 60 seconds
-    "/youtube_search": (10, 60),
+    "/search": (20, 60),
     "/add": (5, 60)
 }
 rate_limit_store = defaultdict(list)
@@ -116,6 +110,10 @@ def refresh_cache(force=False):
         cached_records, cached_texts, cached_vectorizer = [], [], None
 
 refresh_cache(force=True)
+
+# ---------------- YouTube Cache ----------------
+youtube_cache = {}
+YOUTUBE_CACHE_TTL = timedelta(minutes=10)
 
 # ---------------- Dictionary Lookup ----------------
 async def get_dictionary_meaning(word: str):
@@ -163,7 +161,7 @@ def health_check():
         "youtube_keys_count": len(YOUTUBE_API_KEYS)
     }
 
-# ---------------- Search Endpoint ----------------
+# ---------------- Main Search Endpoint ----------------
 @app.get("/search")
 async def search(
     q: Optional[str] = Query(None),
@@ -182,7 +180,9 @@ async def search(
     if len(q.split()) == 1 and len(q) <= 20:
         dictionary_results = await get_dictionary_meaning(q)
 
-    # Supabase search
+    # ---------------- Supabase results ----------------
+    main_results = []
+
     if cached_texts and cached_vectorizer:
         query_vec = cached_vectorizer.transform([q])
         doc_vecs = cached_vectorizer.transform(cached_texts)
@@ -191,12 +191,12 @@ async def search(
         combined = [(rec, sim, fuzzy) for rec, sim, fuzzy in zip(cached_records, similarities, fuzzy_scores)]
         combined.sort(key=lambda x: (x[1], x[2]), reverse=True)
         supabase_results = [
-            {**rec, "image_url": rec.get("image_url", None)}
+            {**rec, "image_url": rec.get("image_url", None), "type": "supabase"}
             for rec, sim, fuzzy in combined if sim > 0.1 or fuzzy > 60
         ]
-        results.extend(supabase_results[:limit])
+        main_results.extend(supabase_results[:limit])
 
-    # Wikimedia API search
+    # ---------------- Wikimedia results ----------------
     try:
         wikimedia_url = (
             "https://en.wikipedia.org/w/api.php?"
@@ -207,51 +207,65 @@ async def search(
             resp = await client.get(wikimedia_url)
             data = resp.json()
             if "query" in data and "pages" in data["query"]:
+                wiki_results = []
                 for page_data in data["query"]["pages"].values():
-                    results.append({
+                    wiki_results.append({
                         "title": page_data.get("title"),
                         "extract": page_data.get("extract", ""),
                         "image_url": page_data.get("thumbnail", {}).get("source"),
-                        "page_url": f"https://en.wikipedia.org/?curid={page_data.get('pageid')}"
+                        "page_url": f"https://en.wikipedia.org/?curid={page_data.get('pageid')}",
+                        "type": "wiki"
                     })
+                main_results.extend(wiki_results[:limit - len(main_results)])
     except Exception as e:
         logger.error(f"Wikimedia API error: {e}")
 
+    # ---------------- YouTube inline (cached) ----------------
+    if YOUTUBE_API_KEYS:
+        now = datetime.utcnow()
+        cached_video = youtube_cache.get(q)
+        if cached_video and now - cached_video["timestamp"] < YOUTUBE_CACHE_TTL:
+            main_results.insert(0, cached_video["data"])
+        else:
+            for key in YOUTUBE_API_KEYS:
+                try:
+                    url = "https://www.googleapis.com/youtube/v3/search"
+                    params = {
+                        "part": "snippet",
+                        "q": q,
+                        "type": "video",
+                        "maxResults":6,
+                        "key": key
+                    }
+                    response = httpx.get(url, params=params, timeout=5)
+                    if response.status_code == 200:
+                        items = response.json().get("items", [])
+                        if items:
+                            video = items[0]
+                            video_data = {
+                                "video_id": video["id"]["videoId"],
+                                "title": video["snippet"]["title"],
+                                "description": video["snippet"]["description"],
+                                "channel": video["snippet"]["channelTitle"],
+                                "thumbnail": video["snippet"]["thumbnails"]["high"]["url"],
+                                "type": "youtube",
+                                "used_key": key
+                            }
+                            youtube_cache[q] = {"data": video_data, "timestamp": now}
+                            main_results.insert(0, video_data)
+                        break
+                except Exception as e:
+                    logger.error(f"YouTube API error with key {key}: {e}")
+                    continue
+
+    # Return results respecting limit
     return {
         "page": page,
         "limit": limit,
-        "total_results": len(results),
-        "results": results[:limit],
+        "total_results": len(main_results),
+        "results": main_results[:limit],
         "dictionary": dictionary_results
     }
-
-# ---------------- YouTube Search ----------------
-@app.get("/youtube_search")
-def youtube_search(query: str = Query(...)):
-    query = sanitize_query(query)
-    if not YOUTUBE_API_KEYS:
-        raise HTTPException(status_code=500, detail="No YouTube API keys configured")
-
-    for key in YOUTUBE_API_KEYS:
-        try:
-            url = "https://www.googleapis.com/youtube/v3/search"
-            params = {
-                "part": "snippet",
-                "q": query,
-                "type": "video",
-                "maxResults": 5,
-                "key": key
-            }
-            response = httpx.get(url, params=params, timeout=5)
-            if response.status_code == 200:
-                return {"results": response.json().get("items", []), "used_key": key}
-            elif response.status_code == 403:
-                logger.warning(f"Quota exceeded or forbidden for key: {key}")
-                continue
-        except Exception as e:
-            logger.error(f"YouTube API error with key {key}: {e}")
-            continue
-    return {"message": "All YouTube API keys failed or quota exceeded"}
 
 # ---------------- Add Link ----------------
 @app.post("/add")
