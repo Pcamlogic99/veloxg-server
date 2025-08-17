@@ -223,9 +223,9 @@ async def search(
     # ---------------- YouTube inline (cached) ----------------
     if YOUTUBE_API_KEYS:
         now = datetime.utcnow()
-        cached_video = youtube_cache.get(q)
-        if cached_video and now - cached_video["timestamp"] < YOUTUBE_CACHE_TTL:
-            main_results.insert(0, cached_video["data"])
+        cached_videos = youtube_cache.get(q)
+        if cached_videos and now - cached_videos["timestamp"] < YOUTUBE_CACHE_TTL:
+            main_results = cached_videos["data"] + main_results
         else:
             for key in YOUTUBE_API_KEYS:
                 try:
@@ -234,25 +234,27 @@ async def search(
                         "part": "snippet",
                         "q": q,
                         "type": "video",
-                        "maxResults":6,
+                        "maxResults": 6,
                         "key": key
                     }
                     response = httpx.get(url, params=params, timeout=5)
                     if response.status_code == 200:
                         items = response.json().get("items", [])
                         if items:
-                            video = items[0]
-                            video_data = {
-                                "video_id": video["id"]["videoId"],
-                                "title": video["snippet"]["title"],
-                                "description": video["snippet"]["description"],
-                                "channel": video["snippet"]["channelTitle"],
-                                "thumbnail": video["snippet"]["thumbnails"]["high"]["url"],
-                                "type": "youtube",
-                                "used_key": key
-                            }
-                            youtube_cache[q] = {"data": video_data, "timestamp": now}
-                            main_results.insert(0, video_data)
+                            videos_data = []
+                            for video in items:
+                                video_data = {
+                                    "video_id": video["id"]["videoId"],
+                                    "title": video["snippet"]["title"],
+                                    "description": video["snippet"]["description"],
+                                    "channel": video["snippet"]["channelTitle"],
+                                    "thumbnail": video["snippet"]["thumbnails"]["high"]["url"],
+                                    "type": "youtube",
+                                    "used_key": key
+                                }
+                                videos_data.append(video_data)
+                            youtube_cache[q] = {"data": videos_data, "timestamp": now}
+                            main_results = videos_data + main_results
                         break
                 except Exception as e:
                     logger.error(f"YouTube API error with key {key}: {e}")
