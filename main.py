@@ -166,67 +166,28 @@ def health_check():
 async def search(
     q: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=50),
+    limit: int = Query(15, ge=1, le=50),
 ):
     if not q:
         raise HTTPException(status_code=400, detail="Search query required")
     q = sanitize_query(q)
     refresh_cache()
 
-    results = []
+    main_results = []
 
     # Dictionary lookup
     dictionary_results = None
     if len(q.split()) == 1 and len(q) <= 20:
         dictionary_results = await get_dictionary_meaning(q)
 
-    # ---------------- Supabase results ----------------
-    main_results = []
-
-    if cached_texts and cached_vectorizer:
-        query_vec = cached_vectorizer.transform([q])
-        doc_vecs = cached_vectorizer.transform(cached_texts)
-        similarities = (doc_vecs * query_vec.T).toarray().flatten()
-        fuzzy_scores = [fuzz.token_set_ratio(q, text) for text in cached_texts]
-        combined = [(rec, sim, fuzzy) for rec, sim, fuzzy in zip(cached_records, similarities, fuzzy_scores)]
-        combined.sort(key=lambda x: (x[1], x[2]), reverse=True)
-        supabase_results = [
-            {**rec, "image_url": rec.get("image_url", None), "type": "supabase"}
-            for rec, sim, fuzzy in combined if sim > 0.1 or fuzzy > 60
-        ]
-        main_results.extend(supabase_results[:limit])
-
-    # ---------------- Wikimedia results ----------------
-    try:
-        wikimedia_url = (
-            "https://en.wikipedia.org/w/api.php?"
-            f"action=query&generator=search&gsrsearch={q}&"
-            "prop=pageimages|extracts&exintro&explaintext&format=json&pithumbsize=200"
-        )
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(wikimedia_url)
-            data = resp.json()
-            if "query" in data and "pages" in data["query"]:
-                wiki_results = []
-                for page_data in data["query"]["pages"].values():
-                    wiki_results.append({
-                        "title": page_data.get("title"),
-                        "extract": page_data.get("extract", ""),
-                        "image_url": page_data.get("thumbnail", {}).get("source"),
-                        "page_url": f"https://en.wikipedia.org/?curid={page_data.get('pageid')}",
-                        "type": "wiki"
-                    })
-                main_results.extend(wiki_results[:limit - len(main_results)])
-    except Exception as e:
-        logger.error(f"Wikimedia API error: {e}")
-
-    # ---------------- YouTube inline (cached) ----------------
+    # ---------------- YouTube Videos ----------------
     if YOUTUBE_API_KEYS:
         now = datetime.utcnow()
         cached_videos = youtube_cache.get(q)
         if cached_videos and now - cached_videos["timestamp"] < YOUTUBE_CACHE_TTL:
-            main_results = cached_videos["data"] + main_results
+            videos_data = cached_videos["data"]
         else:
+            videos_data = []
             for key in YOUTUBE_API_KEYS:
                 try:
                     url = "https://www.googleapis.com/youtube/v3/search"
@@ -240,32 +201,69 @@ async def search(
                     response = httpx.get(url, params=params, timeout=5)
                     if response.status_code == 200:
                         items = response.json().get("items", [])
-                        if items:
-                            videos_data = []
-                            for video in items:
-                                video_data = {
-                                    "video_id": video["id"]["videoId"],
-                                    "title": video["snippet"]["title"],
-                                    "description": video["snippet"]["description"],
-                                    "channel": video["snippet"]["channelTitle"],
-                                    "thumbnail": video["snippet"]["thumbnails"]["high"]["url"],
-                                    "type": "youtube",
-                                    "used_key": key
-                                }
-                                videos_data.append(video_data)
-                            youtube_cache[q] = {"data": videos_data, "timestamp": now}
-                            main_results = videos_data + main_results
+                        for video in items:
+                            videos_data.append({
+                                "video_id": video["id"]["videoId"],
+                                "title": video["snippet"]["title"],
+                                "description": video["snippet"]["description"],
+                                "channel": video["snippet"]["channelTitle"],
+                                "thumbnail": video["snippet"]["thumbnails"]["high"]["url"],
+                                "type": "youtube",
+                                "used_key": key
+                            })
+                        youtube_cache[q] = {"data": videos_data, "timestamp": now}
                         break
                 except Exception as e:
                     logger.error(f"YouTube API error with key {key}: {e}")
                     continue
+        main_results.extend(videos_data)
 
-    # Return results respecting limit
+    # ---------------- Supabase results ----------------
+    if cached_texts and cached_vectorizer:
+        query_vec = cached_vectorizer.transform([q])
+        doc_vecs = cached_vectorizer.transform(cached_texts)
+        similarities = (doc_vecs * query_vec.T).toarray().flatten()
+        fuzzy_scores = [fuzz.token_set_ratio(q, text) for text in cached_texts]
+        combined = [(rec, sim, fuzzy) for rec, sim, fuzzy in zip(cached_records, similarities, fuzzy_scores)]
+        combined.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        supabase_results = [
+            {**rec, "image_url": rec.get("image_url", None), "type": "supabase"}
+            for rec, sim, fuzzy in combined if sim > 0.1 or fuzzy > 60
+        ]
+        main_results.extend(supabase_results)
+
+    # ---------------- Wikimedia ----------------
+    try:
+        wikimedia_url = (
+            "https://en.wikipedia.org/w/api.php?"
+            f"action=query&generator=search&gsrsearch={q}&"
+            "prop=pageimages|extracts&exintro&explaintext&format=json&pithumbsize=200"
+        )
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(wikimedia_url)
+            data = resp.json()
+            if "query" in data and "pages" in data["query"]:
+                for page_data in data["query"]["pages"].values():
+                    main_results.append({
+                        "title": page_data.get("title"),
+                        "extract": page_data.get("extract", ""),
+                        "image_url": page_data.get("thumbnail", {}).get("source"),
+                        "page_url": f"https://en.wikipedia.org/?curid={page_data.get('pageid')}",
+                        "type": "wiki"
+                    })
+    except Exception as e:
+        logger.error(f"Wikimedia API error: {e}")
+
+    # ---------------- Pagination ----------------
+    start = (page - 1) * limit
+    end = start + limit
+    paginated_results = main_results[start:end]
+
     return {
         "page": page,
         "limit": limit,
         "total_results": len(main_results),
-        "results": main_results[:limit],
+        "results": paginated_results,
         "dictionary": dictionary_results
     }
 
