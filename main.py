@@ -8,12 +8,10 @@ import logging
 from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
 import httpx
-import urllib.parse
 import re
 from typing import Optional
 from collections import defaultdict
 import time
-import asyncio  # added for async gathering of football/location APIs
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
@@ -147,19 +145,6 @@ def sanitize_query(q: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid characters in query")
     return q
 
-# ---------------- Helper: async fetch JSON ----------------
-async def _fetch_json(client: httpx.AsyncClient, url: str, params: dict = None):
-    try:
-        resp = await client.get(url, params=params, timeout=10)
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            logger.debug(f"Non-200 from {url}: {resp.status_code}")
-            return {"error": f"Status {resp.status_code}"}
-    except Exception as e:
-        logger.error(f"Error fetching {url}: {e}")
-        return {"error": str(e)}
-
 # ---------------- Routes ----------------
 @app.get("/")
 def home():
@@ -175,119 +160,6 @@ def health_check():
         "cached_records": len(cached_records),
         "youtube_keys_count": len(YOUTUBE_API_KEYS)
     }
-
-# ---------------- Football helper ----------------
-async def get_football_data_for_query(q: str):
-    """
-    Calls:
-    - https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=
-    - https://www.thesportsdb.com/api/v1/json/3/eventslast.php?t=
-    - https://www.thesportsdb.com/api/v1/json/3/eventsnext.php?t=
-    - https://www.thesportsdb.com/api/v1/json/3/lookuptable.php?l=4328&s=
-    - https://api.openligadb.de/getmatchdata/bl1/2025
-    """
-    base_sportsdb = "https://www.thesportsdb.com/api/v1/json/3"
-    endpoints = {
-        "team_info": f"{base_sportsdb}/searchteams.php",
-        "last_events": f"{base_sportsdb}/eventslast.php",
-        "next_events": f"{base_sportsdb}/eventsnext.php",
-        "league_table": f"{base_sportsdb}/lookuptable.php",
-        "bundesliga": "https://api.openligadb.de/getmatchdata/bl1/2025"
-    }
-    results = {}
-    async with httpx.AsyncClient() as client:
-        # team_info, last_events, next_events (pass q as t param)
-        tasks = [
-            _fetch_json(client, endpoints["team_info"], params={"t": q}),
-            _fetch_json(client, endpoints["last_events"], params={"t": q}),
-            _fetch_json(client, endpoints["next_events"], params={"t": q}),
-            _fetch_json(client, endpoints["league_table"], params={"l": "4328", "s": "2024-2025"}),
-            _fetch_json(client, endpoints["bundesliga"])
-        ]
-        team_info, last_events, next_events, league_table, bund = await asyncio.gather(*tasks, return_exceptions=False)
-        results["team_info"] = team_info
-        results["last_events"] = last_events
-        results["next_events"] = next_events
-        results["league_table"] = league_table
-        results["bundesliga"] = bund
-    return results
-
-# ---------------- Location helper ----------------
-async def get_location_data_for_query(q: str):
-    """
-    Uses:
-    - Nominatim: https://nominatim.openstreetmap.org/search?city=Dar+es+Salaam&format=json
-      (falls back to generic q parameter if city param returns empty)
-    - Open-Meteo: https://api.open-meteo.com/v1/forecast?latitude=-6.8&longitude=39.28&current_weather=true
-    - Wikipedia summary: https://en.wikipedia.org/api/rest_v1/page/summary/Dar_es_Salaam
-    - Wikimedia Commons images (3)
-    """
-    results = {}
-    async with httpx.AsyncClient() as client:
-        # Try Nominatim with city param first, then fallback to q as generic search
-        nominatim_city_url = "https://nominatim.openstreetmap.org/search"
-        nom_params = {"city": q, "format": "json"}
-        nom_data = await _fetch_json(client, nominatim_city_url, params=nom_params)
-        if isinstance(nom_data, dict) and nom_data.get("error"):
-            # try fallback generic q
-            nom_params2 = {"q": q, "format": "json"}
-            nom_data = await _fetch_json(client, nominatim_city_url, params=nom_params2)
-
-        results["nominatim"] = nom_data
-
-        lat = None
-        lon = None
-        if isinstance(nom_data, list) and len(nom_data) > 0:
-            lat = nom_data[0].get("lat")
-            lon = nom_data[0].get("lon")
-
-        if lat and lon:
-            # Weather
-            weather_url = "https://api.open-meteo.com/v1/forecast"
-            weather_params = {"latitude": lat, "longitude": lon, "current_weather": "true"}
-            weather_data = await _fetch_json(client, weather_url, params=weather_params)
-            results["weather"] = weather_data
-
-        # Wikipedia summary
-        try:
-            # Prepare page title: replace spaces with underscores
-            wiki_title = q.replace(" ", "_")
-            wiki_summary_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{wiki_title}"
-            wiki_summary = await _fetch_json(client, wiki_summary_url)
-            results["wikipedia_summary"] = wiki_summary
-        except Exception as e:
-            logger.error(f"Wikipedia summary fetch error for {q}: {e}")
-
-        # Wikimedia Commons images (generator=search, gsrlimit=3, prop=imageinfo&iiprop=url)
-        try:
-            commons_url = "https://commons.wikimedia.org/w/api.php"
-            commons_params = {
-                "action": "query",
-                "generator": "search",
-                "gsrsearch": q,
-                "gsrlimit": 6,  # get a few and filter images
-                "prop": "imageinfo",
-                "iiprop": "url",
-                "format": "json"
-            }
-            commons_resp = await _fetch_json(client, commons_url, params=commons_params)
-            images = []
-            if isinstance(commons_resp, dict) and "query" in commons_resp and "pages" in commons_resp["query"]:
-                for page in commons_resp["query"]["pages"].values():
-                    imageinfo = page.get("imageinfo")
-                    if imageinfo and isinstance(imageinfo, list):
-                        url = imageinfo[0].get("url")
-                        if url and url.lower().endswith((".jpg", ".jpeg", ".png", ".svg")):
-                            images.append(url)
-                    # stop when we have 3 images
-                    if len(images) >= 3:
-                        break
-            results["images"] = images
-        except Exception as e:
-            logger.error(f"Wikimedia images error for {q}: {e}")
-            results["images"] = []
-
-    return results
 
 # ---------------- Main Search Endpoint ----------------
 @app.get("/search")
@@ -371,91 +243,16 @@ async def search(
             resp = await client.get(wikimedia_url)
             data = resp.json()
             if "query" in data and "pages" in data["query"]:
-                # For each wiki page, try to gather up to 2 useful images from Wikimedia Commons
-                commons_api = "https://commons.wikimedia.org/w/api.php"
                 for page_data in data["query"]["pages"].values():
-                    title = page_data.get("title")
-                    extract = page_data.get("extract", "")
-                    thumb = page_data.get("thumbnail", {}).get("source")
-
-                    # extract a likely year (first 4-digit year in the extract)
-                    year = None
-                    try:
-                        m = re.search(r"\b(18|19|20)\d{2}\b", extract)
-                        if m:
-                            year = m.group(0)
-                    except Exception:
-                        year = None
-
-                    images = []
-                    if thumb:
-                        images.append(thumb)
-
-                    # query Commons for images related to the page title (limit 4 and filter)
-                    try:
-                        commons_params = {
-                            "action": "query",
-                            "generator": "search",
-                            "gsrsearch": title or q,
-                            "gsrlimit": 6,
-                            "prop": "imageinfo",
-                            "iiprop": "url",
-                            "format": "json"
-                        }
-                        commons_resp = await _fetch_json(client, commons_api, params=commons_params)
-                        if isinstance(commons_resp, dict) and "query" in commons_resp and "pages" in commons_resp["query"]:
-                            for page in commons_resp["query"]["pages"].values():
-                                imageinfo = page.get("imageinfo")
-                                if imageinfo and isinstance(imageinfo, list):
-                                    url = imageinfo[0].get("url")
-                                    if url and url.lower().endswith((".jpg", ".jpeg", ".png", ".svg")):
-                                        if url not in images:
-                                            images.append(url)
-                                if len(images) >= 2:
-                                    break
-                    except Exception as e:
-                        logger.debug(f"Commons images fetch failed for {title}: {e}")
-
-                    wiki_page_url = f"https://en.wikipedia.org/?curid={page_data.get('pageid')}"
-                    wikimedia_search_url = f"https://commons.wikimedia.org/w/index.php?search={urllib.parse.quote(title or q)}"
-
                     main_results.append({
-                        "title": title,
-                        "extract": extract,
-                        "about": extract.split('\n', 1)[0] if extract else "",
-                        "year": year,
-                        "images": images,  # up to 2 images (thumbnail + commons)
-                        "image_url": thumb,
-                        "wikipedia_url": wiki_page_url,
-                        "wikimedia_search_url": wikimedia_search_url,
+                        "title": page_data.get("title"),
+                        "extract": page_data.get("extract", ""),
+                        "image_url": page_data.get("thumbnail", {}).get("source"),
+                        "page_url": f"https://en.wikipedia.org/?curid={page_data.get('pageid')}",
                         "type": "wiki"
                     })
     except Exception as e:
         logger.error(f"Wikimedia API error: {e}")
-
-    # ---------------- Football Data (TheSportsDB + OpenLigaDB) ----------------
-    try:
-        football_data = await get_football_data_for_query(q)
-        main_results.append({
-            "type": "football",
-            "title": f"Football data for {q}",
-            "football_data": football_data
-        })
-    except Exception as e:
-        logger.error(f"Football API error: {e}")
-
-    # ---------------- Location / Place Data (Nominatim, Open-Meteo, Wiki summary, Wikimedia images) ----------------
-    try:
-        location_data = await get_location_data_for_query(q)
-        # If location_data contains useful info, append it as a result
-        if location_data:
-            main_results.append({
-                "type": "location",
-                "title": f"Location data for {q}",
-                "location_data": location_data
-            })
-    except Exception as e:
-        logger.error(f"Location API error: {e}")
 
     # ---------------- Pagination ----------------
     start = (page - 1) * limit
@@ -482,4 +279,4 @@ def add_link(data: dict = Body(...)):
         return {"message": "Link added", "data": response.data}
     except Exception as e:
         logger.error(f"Error adding link: {e}")
-        raise HTTPException(status_code=500, detail="Database insert failed")
+        raise HTTPException(status_code=500, detail="Database insert failed")
