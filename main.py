@@ -20,17 +20,18 @@ import asyncio
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("veloxg")
 
-# ---------------- Load ENV ----------------
+# ---------------- ENV ----------------
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+PORT = int(os.getenv("PORT", 3000))
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Missing SUPABASE_URL or SUPABASE_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------------- Load YouTube Keys ----------------
+# ---------------- YouTube Keys ----------------
 def load_youtube_keys():
     keys = []
     main_key = os.getenv("YOUTUBE_API_KEYS")
@@ -45,7 +46,7 @@ def load_youtube_keys():
 YOUTUBE_API_KEYS = load_youtube_keys()
 
 # ---------------- App Config ----------------
-app = FastAPI(title="VeloxG API Optimized", version="3.2.2")
+app = FastAPI(title="VeloxG API Optimized", version="3.2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -189,7 +190,21 @@ async def fetch_location(q: str):
             results["weather"] = w
     return results
 
-# ---------------- Main Endpoint ----------------
+# ---------------- Routes ----------------
+@app.get("/")
+def home():
+    return {"message": "VeloxG API is running", "status": "ok"}
+
+@app.get("/health")
+def health_check():
+    """Used by Koyeb to verify the service is alive"""
+    return {
+        "status": "healthy",
+        "version": "3.2.3",
+        "cached_records": len(cached_records),
+        "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
+    }
+
 @app.get("/search")
 async def search(q: str = Query(...), include: Optional[str] = Query(None)):
     q = q.strip()
@@ -202,6 +217,7 @@ async def search(q: str = Query(...), include: Optional[str] = Query(None)):
             sources = s
 
     results = []
+    # Supabase search
     if "supabase" in sources and cached_records:
         try:
             if cached_vectorizer:
@@ -234,7 +250,6 @@ async def search(q: str = Query(...), include: Optional[str] = Query(None)):
 
     return {"results": results, "count": len(results), "sources": sources}
 
-# ---------------- Add Link ----------------
 @app.post("/add")
 def add_link(data: dict = Body(...)):
     if not data.get("title") or not data.get("url"):
@@ -248,6 +263,7 @@ def add_link(data: dict = Body(...)):
         logger.error(f"Add link error: {e}")
         raise HTTPException(status_code=500, detail="Database insert failed")
 
-@app.get("/")
-def home():
-    return {"message": "VeloxG API is running OK"}
+# ---------------- Run (for local dev) ----------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
